@@ -384,24 +384,87 @@ function b64Utf8(s) {
 
 /* ==================== GitHub API ==================== */
 
-class GitHub {
+/* ==================== 服务商 ====================
+ *
+ * 三家走的协议完全不同，所以抽象成 provider：
+ *
+ *   GitHub —— Git Data API（建 blob → 建 tree → 一次 commit）
+ *             可以一批改动合成一个 commit
+ *
+ *   Gitee  —— Contents API（逐文件 POST/PUT）
+ *             ⚠️ 它的 Git Data API 只有读，没有 create blob/tree/commit，
+ *                所以做不了"一次提交"，只能每个文件一个 commit
+ *
+ *   坚果云 —— WebDAV（PUT 覆盖文件，MKCOL 建目录）
+ *             没有版本概念，纯粹是云端文件夹
+ *
+ * 共同点：都用 git blob sha1 做增量判断，只传变过的。
+ * ==================== */
+
+/** 基类：默认逐文件模式 */
+class Provider {
 	constructor(cfg) {
+		this.cfg = cfg || {};
+	}
+	/** 配置填全了吗 */
+	ok() {
+		return false;
+	}
+	/** 一批改动能否合成一个提交 */
+	get atomic() {
+		return false;
+	}
+	/** 显示名 */
+	get label() {
+		return '未知';
+	}
+	/** 远端根目录前缀 */
+	root() {
+		return String((this.cfg && this.cfg.remoteRoot) || '').replace(/^\/+|\/+$/g, '');
+	}
+	remotePath(local) {
+		const r = this.root();
+		return r ? r + '/' + local : local;
+	}
+	async test() {
+		return { ok: false, msg: '没实现' };
+	}
+	/** 远端指纹 { path: sha } */
+	async list() {
+		return {};
+	}
+	async put(path, u8, sha, msg) {
+		throw new Error('没实现');
+	}
+	async commitAll(items, msg) {
+		throw new Error('没实现');
+	}
+}
+
+/* ---------- GitHub ---------- */
+
+class GitHubProvider extends Provider {
+	constructor(cfg) {
+		super(cfg);
 		this.token = cfg.token || '';
 		this.owner = cfg.owner || '';
 		this.repo = cfg.repo || '';
 		this.branch = cfg.branch || 'main';
 	}
-
+	get label() {
+		return 'GitHub';
+	}
+	get atomic() {
+		return true;
+	}
 	ok() {
 		return !!(this.token && this.owner && this.repo);
 	}
-
 	base() {
 		return 'https://api.github.com/repos/' + this.owner + '/' + this.repo;
 	}
-
 	async req(method, path, body) {
-		const url = (path.indexOf('http') === 0 ? path : this.base() + path);
+		const url = path.indexOf('http') === 0 ? path : this.base() + path;
 		const headers = {
 			Authorization: 'Bearer ' + this.token,
 			Accept: 'application/vnd.github+json',
@@ -417,7 +480,7 @@ class GitHub {
 			throw: false,
 		});
 		if (r.status >= 400) {
-			const m = (r.json && r.json.message) || ('HTTP ' + r.status);
+			const m = (r.json && r.json.message) || 'HTTP ' + r.status;
 			const e = new Error(m);
 			e.status = r.status;
 			throw e;
@@ -429,50 +492,284 @@ class GitHub {
 			return {};
 		}
 	}
-
-	/** 远端所有文件 → { path: sha } */
-	async remoteTree() {
+	async latest() {
 		const ref = await this.req('GET', '/git/ref/heads/' + this.branch);
-		const commit = await this.req('GET', '/git/commits/' + ref.object.sha);
-		const tree = await this.req('GET', '/git/trees/' + commit.tree.sha + '?recursive=1');
+		const c = await this.req('GET', '/git/commits/' + ref.object.sha);
+		const t = await this.req('GET', '/git/trees/' + c.tree.sha + '?recursive=1');
 		const map = {};
-		for (const t of tree.tree || []) {
-			if (t.type === 'blob') map[t.path] = t.sha;
+		for (const it of t.tree || []) if (it.type === 'blob') map[it.path] = it.sha;
+		return { map: map, commitSha: ref.object.sha, treeSha: c.tree.sha };
+	}
+	async list() {
+		const r = await this.latest();
+		return r.map;
+	}
+	async test() {
+		const r = await this.req('GET', '');
+		return {
+			ok: true,
+			msg: '连上了：' + r.full_name + (r.private ? '（私有）' : '（公开）'),
+			private: r.private,
+		};
+	}
+	async put(path, u8, sha, msg) {
+		// 逐文件模式（GitHub 一般走 commitAll，这个留着兜底）
+		const b64 = toB64(u8);
+		let cur = null;
+		try {
+			cur = await this.req('GET', '/contents/' + encodeURI(path) + '?ref=' + this.branch);
+		} catch (e) {
+			cur = null;
 		}
-		return { map: map, commitSha: ref.object.sha, treeSha: commit.tree.sha, truncated: !!tree.truncated };
+		const body = { message: msg, content: b64, branch: this.branch };
+		if (cur && cur.sha) body.sha = cur.sha;
+		await this.req('PUT', '/contents/' + encodeURI(path), body);
 	}
-
-	async createBlob(b64) {
-		const r = await this.req('POST', '/git/blobs', { content: b64, encoding: 'base64' });
-		return r.sha;
-	}
-
-	async commit(message, treeItems, baseTreeSha, parentSha) {
-		const t = await this.req('POST', '/git/trees', {
-			base_tree: baseTreeSha,
-			tree: treeItems,
-		});
+	async commitAll(items, msg) {
+		const r = await this.latest();
+		const tree = [];
+		for (const it of items) {
+			const s = await this.req('POST', '/git/blobs', {
+				content: toB64(it.u8),
+				encoding: 'base64',
+			});
+			tree.push({ path: it.rp, mode: '100644', type: 'blob', sha: s.sha });
+			it.sha = s.sha;
+		}
+		const t = await this.req('POST', '/git/trees', { base_tree: r.treeSha, tree: tree });
 		const c = await this.req('POST', '/git/commits', {
-			message: message,
+			message: msg,
 			tree: t.sha,
-			parents: parentSha ? [parentSha] : [],
+			parents: r.commitSha ? [r.commitSha] : [],
 		});
 		await this.req('PATCH', '/git/refs/heads/' + this.branch, { sha: c.sha });
 		return c.sha;
 	}
+}
 
-	async repoInfo() {
-		return await this.req('GET', '');
+/* ---------- 通用 Git 平台（Gitee / 自建 Gitea / 其它国产托管） ----------
+ * ⚠️ 这类平台的 Git Data API 大多只有 GET blob / GET tree，
+ *    没有 create blob、create tree、create commit、update ref。
+ *    所以走 Contents API 逐文件提交，做不到"一批一个 commit"。
+ *
+ * 地址由用户自己填（设置页「仓库 API 地址」），
+ * 填到「仓库」这一级，例如：
+ *   Gitee   https://gitee.com/api/v5/repos/用户名/仓库名
+ *   自建    https://git.example.com/api/v1/repos/用户名/仓库名
+ */
+
+class GitProvider extends Provider {
+	constructor(cfg) {
+		super(cfg);
+		this.token = cfg.token || '';
+		this.owner = cfg.owner || '';
+		this.repo = cfg.repo || '';
+		this.branch = cfg.branch || 'master';
+		this.apiBase = String((cfg && cfg.apiBase) || '').trim().replace(/\/+$/, '');
+	}
+	get label() {
+		return this.owner ? this.owner + '/' + this.repo : this.apiBase ? '通用 Git' : '通用 Git';
+	}
+	ok() {
+		// 填了 API 地址就以它为准；否则退回 owner/repo 拼 Gitee 格式
+		if (this.apiBase) return !!this.token;
+		return !!(this.token && this.owner && this.repo);
+	}
+	/** 仓库 API 前缀，用户自己填 */
+	base() {
+		if (this.apiBase) return this.apiBase;
+		return 'https://gitee.com/api/v5/repos/' + this.owner + '/' + this.repo;
+	}
+	/** Gitee 用 query 参数传 token */
+	withToken(url) {
+		return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'access_token=' + encodeURIComponent(this.token);
+	}
+	async req(method, path, body) {
+		const url = this.withToken(path.indexOf('http') === 0 ? path : this.base() + path);
+		const headers = {
+			Accept: 'application/json',
+			'User-Agent': 'mogeo-sync',
+			'Content-Type': 'application/json;charset=UTF-8',
+		};
+		const r = await requestUrl({
+			url: url,
+			method: method,
+			headers: headers,
+			body: body ? JSON.stringify(body) : undefined,
+			throw: false,
+		});
+		if (r.status >= 400) {
+			const j = r.json || {};
+			const m = j.message || ('HTTP ' + r.status);
+			const e = new Error(m);
+			e.status = r.status;
+			throw e;
+		}
+		if (r.status === 204 || !r.text) return {};
+		try {
+			return r.json || JSON.parse(r.text);
+		} catch (e) {
+			return {};
+		}
+	}
+	async test() {
+		const r = await this.req('GET', '');
+		return {
+			ok: true,
+			msg: '连上了：' + (r.full_name || r.name || this.owner + '/' + this.repo) +
+				(r.private ? '（私有）' : '（公开）'),
+			private: r.private,
+		};
+	}
+	/** 列目录（递归拿 sha 做增量判断） */
+	async list() {
+		const map = {};
+		const walk = async (dir) => {
+			let items;
+			try {
+				items = await this.req('GET', '/contents/' + encodeURI(dir) + '?ref=' + this.branch);
+			} catch (e) {
+				return;
+			}
+			if (!Array.isArray(items)) return;
+			for (const it of items) {
+				if (it.type === 'dir') {
+					await walk(it.path);
+				} else if (it.type === 'file') {
+					map[it.path] = it.sha;
+				}
+			}
+		};
+		await walk(this.root() || '');
+		return map;
+	}
+	async put(path, u8, sha, msg) {
+		// 路径编码：Gitee 要求 path 里的 / 保持，其余编码
+		const enc = String(path).split('/').map(encodeURIComponent).join('/');
+		let cur = null;
+		try {
+			cur = await this.req('GET', '/contents/' + enc + '?ref=' + this.branch);
+		} catch (e) {
+			cur = null;
+		}
+		const body = {
+			access_token: this.token,
+			content: toB64(u8),
+			message: msg,
+			branch: this.branch,
+		};
+		if (cur && cur.sha) body.sha = cur.sha;
+		await this.req(cur && cur.sha ? 'PUT' : 'POST', '/contents/' + enc, body);
 	}
 }
 
-/* ==================== 设置 ==================== */
+/* ---------- 坚果云（WebDAV） ---------- */
+
+class WebDAVProvider extends Provider {
+	constructor(cfg) {
+		super(cfg);
+		this.user = cfg.webdavUser || '';
+		this.pass = cfg.webdavPass || '';
+		this.baseUrl = String((cfg && cfg.webdavUrl) || 'https://dav.jianguoyun.com/dav/').replace(/\/+$/, '') + '/';
+	}
+	get label() {
+		return '坚果云';
+	}
+	ok() {
+		return !!(this.user && this.pass);
+	}
+	auth() {
+		return 'Basic ' + btoa(this.user + ':' + this.pass);
+	}
+	fullUrl(path) {
+		return this.baseUrl + String(path).split('/').map(encodeURIComponent).join('/');
+	}
+	async req(method, path, bodyU8, headers) {
+		const h = { Authorization: this.auth(), 'User-Agent': 'mogeo-sync' };
+		if (headers) Object.assign(h, headers);
+		const r = await requestUrl({
+			url: this.fullUrl(path),
+			method: method,
+			headers: h,
+			body: bodyU8 ? bodyU8.buffer : undefined,
+			throw: false,
+		});
+		// 201 Created / 204 No Content / 200 OK / 207 Multi-Status 都算成功
+		if (r.status >= 400) {
+			const e = new Error(
+				method === 'PUT' && r.status === 401
+					? '账号或应用密码不对'
+					: method + ' 失败（HTTP ' + r.status + '）'
+			);
+			e.status = r.status;
+			throw e;
+		}
+		return r;
+	}
+	async test() {
+		// PROPFIND 根目录，能通就是密码对
+		try {
+			await this.req('PROPFIND', '', null, { Depth: '0' });
+			return { ok: true, msg: '连上了：坚果云（' + this.user + '）', private: true };
+		} catch (e) {
+			// 有些环境不支持 PROPFIND，退回用 PUT 试写一个探针文件
+			try {
+				await this.req('PUT', '.mogeo-probe', utf8('ok'));
+				return { ok: true, msg: '连上了：坚果云（' + this.user + '）', private: true };
+			} catch (e2) {
+				throw e;
+			}
+		}
+	}
+	/** WebDAV 没有 sha 概念，列目录也贵，所以指纹全靠本地记录 */
+	async list() {
+		return null; // null = 让引擎只用本地记录判断
+	}
+	/** 逐级建目录 */
+	async ensureDir(path) {
+		const parts = String(path).split('/');
+		parts.pop(); // 去掉文件名
+		let cur = '';
+		for (const p of parts) {
+			if (!p) continue;
+			cur = cur ? cur + '/' + p : p;
+			try {
+				await this.req('MKCOL', cur);
+			} catch (e) {
+				// 已存在会报 405，忽略
+				if (e.status !== 405 && e.status !== 409) {
+					// 其它错误也先放过，PUT 时会再暴露
+				}
+			}
+		}
+	}
+	async put(path, u8, sha, msg) {
+		await this.ensureDir(path);
+		await this.req('PUT', path, u8, { 'Content-Type': 'text/markdown; charset=utf-8' });
+	}
+}
+
+/** 按设置造一个 provider */
+function makeProvider(cfg) {
+	const t = (cfg && cfg.provider) || 'github';
+	if (t === 'git' || t === 'gitee') return new GitProvider(cfg);
+	if (t === 'jianguoyun') return new WebDAVProvider(cfg);
+	return new GitHubProvider(cfg);
+}
 
 const DEFAULT_SETTINGS = {
+	/** github | git | jianguoyun */
+	provider: 'github',
+	/** 通用 Git 平台的仓库 API 地址（选「中国开源」时填） */
+	apiBase: '',
 	token: '',
 	owner: 'M1kin',
 	repo: 'novel-sync',
 	branch: 'main',
+	/** 坚果云用（WebDAV） */
+	webdavUrl: 'https://dav.jianguoyun.com/dav/',
+	webdavUser: '',
+	webdavPass: '',
 	/** 要备份的本地文件夹（空 = 整个 vault） */
 	folders: ['小说相关'],
 	/** 远端前缀，留空=仓库根 */
@@ -500,14 +797,14 @@ class SyncEngine {
 	cfg() {
 		return this.plugin.settings;
 	}
-	gh() {
-		return new GitHub(this.cfg());
+	/** 当前服务商 */
+	pv() {
+		return makeProvider(this.cfg());
 	}
 
 	/** 本地路径 → 远端路径 */
 	remotePath(local) {
-		const root = String(this.cfg().remoteRoot || '').replace(/^\/+|\/+$/g, '');
-		return root ? root + '/' + local : local;
+		return this.pv().remotePath(local);
 	}
 
 	/** 是否忽略 */
@@ -565,7 +862,7 @@ class SyncEngine {
 	async sync(opt) {
 		opt = opt || {};
 		if (this.running) return { ok: false, msg: '正在同步中' };
-		const g = this.gh();
+		const g = this.pv();
 		if (!g.ok()) {
 			return { ok: false, msg: '还没填仓库信息', needSetup: true };
 		}
@@ -576,29 +873,35 @@ class SyncEngine {
 				return { ok: false, msg: '没有要同步的文件（检查同步文件夹设置）' };
 			}
 
-			// 1) 远端现状
-			const remote = await g.remoteTree();
+			// 1) 远端指纹。WebDAV 返回 null（列目录太贵），纯靠本地记录判断
+			let remote = null;
+			try {
+				remote = await g.list();
+			} catch (e) {
+				remote = null;
+			}
 
-			// 2) 本地算 sha，找出变化的
+			// 2) 找出变化的文件
 			const changed = [];
 			const shas = this.cfg().shas || {};
 			for (const f of files) {
-				let u8;
+				let raw;
 				try {
-					u8 = await this.app.vault.readBinary(f);
+					raw = await this.app.vault.readBinary(f);
 				} catch (e) {
 					continue;
 				}
-				const rp = this.remotePath(f.path);
-				const localSha = blobSha(new Uint8Array(u8));
-				// 本地记录 = 远端 就跳过（没变过）
-				if (shas[f.path] === localSha && remote.map[rp] === localSha) continue;
-				// 远端已存在且一样（换了手机/清了缓存的情况）
-				if (remote.map[rp] === localSha) {
+				const u8 = new Uint8Array(raw);
+				const rp = g.remotePath(f.path);
+				const localSha = blobSha(u8);
+				// 本地记录就是这个 → 没改过，跳过（不用问远端，快）
+				if (shas[f.path] === localSha) continue;
+				// 本地记录不一样，但远端已经有同样内容（换设备/清过记录）
+				if (remote && remote[rp] === localSha) {
 					shas[f.path] = localSha;
 					continue;
 				}
-				changed.push({ file: f, rp: rp, u8: new Uint8Array(u8), sha: localSha });
+				changed.push({ file: f, rp: rp, u8: u8, sha: localSha });
 			}
 
 			if (!changed.length) {
@@ -609,35 +912,31 @@ class SyncEngine {
 				return { ok: true, changed: 0, total: files.length, msg: '没有变化' };
 			}
 
-			// 3) 建 blob
-			const treeItems = [];
-			for (const c of changed) {
-				const b64 = toB64(c.u8);
-				const s = await g.createBlob(b64);
-				if (s !== c.sha) {
-					// 极少数情况服务端算法不同，以服务端为准
-					c.sha = s;
-				}
-				treeItems.push({ path: c.rp, mode: '100644', type: 'blob', sha: s });
-			}
-
-			// 4) 一次提交
+			// 3) 上传：能一次提交的一次提交，不能的逐文件
 			const now = new Date();
 			const pad = (n) => String(n).padStart(2, '0');
-			const stamp = now.getFullYear() + '-' + pad(now.getMonth() + 1) + '-' + pad(now.getDate()) +
+			const stamp =
+				now.getFullYear() + '-' + pad(now.getMonth() + 1) + '-' + pad(now.getDate()) +
 				' ' + pad(now.getHours()) + ':' + pad(now.getMinutes());
 			let msg = '备份 ' + stamp;
 			if (opt.folder) msg += ' · ' + opt.folder;
 			msg += '\n\n' + changed.length + ' 个文件';
 			if (opt.reason === 'menu') msg += '（长按文件夹同步）';
 
-			const commit = await g.commit(msg, treeItems, remote.treeSha, remote.commitSha);
+			let commit = '';
+			if (g.atomic) {
+				commit = await g.commitAll(changed, msg);
+			} else {
+				for (const c of changed) {
+					await g.put(c.rp, c.u8, c.sha, msg);
+				}
+			}
 
-			// 5) 记录
+			// 4) 记住指纹
 			for (const c of changed) shas[c.file.path] = c.sha;
 			this.cfg().shas = shas;
 			this.cfg().lastSync = Date.now();
-			this.cfg().lastCommit = commit;
+			this.cfg().lastCommit = commit || this.cfg().lastCommit || '';
 			this.cfg().lastCount = changed.length;
 			await this.plugin.saveSettings();
 			this.plugin.refreshView();
@@ -652,9 +951,9 @@ class SyncEngine {
 		} catch (e) {
 			const st = e && e.status;
 			let msg = (e && e.message) || String(e);
-			if (st === 401) msg = 'Token 无效或已过期';
-			else if (st === 404) msg = '仓库不存在，或 Token 没权限';
-			else if (st === 403) msg = '被限流了，等一会再试';
+			if (st === 401) msg = g.label + '：账号或令牌不对';
+			else if (st === 404) msg = g.label + '：仓库不存在，或令牌没权限';
+			else if (st === 403) msg = g.label + '：被限流了，等一会再试';
 			return { ok: false, msg: msg };
 		} finally {
 			this.running = false;
@@ -663,23 +962,22 @@ class SyncEngine {
 
 	/** 测试连接 */
 	async test() {
-		const g = this.gh();
-		if (!g.ok()) return { ok: false, msg: '先填 Token / 仓库' };
+		const g = this.pv();
+		if (!g.ok()) return { ok: false, msg: '先去设置里填' + g.label + '的账号信息' };
 		try {
-			const r = await g.repoInfo();
-			return {
-				ok: true,
-				msg: '连上了：' + r.full_name + (r.private ? '（私有）' : '（公开）'),
-				private: r.private,
-			};
+			// 各 provider 自己知道怎么探活
+			const r = await g.test();
+			return r;
 		} catch (e) {
 			const st = e && e.status;
 			let msg = (e && e.message) || String(e);
-			if (st === 401) msg = 'Token 无效或已过期';
-			else if (st === 404) msg = '仓库不存在，或 Token 没这个仓库的权限';
+			if (st === 401) msg = g.label + '：账号或令牌不对';
+			else if (st === 404) msg = g.label + '：仓库不存在，或令牌没权限';
+			else if (st === 403) msg = g.label + '：被限流了，等一会再试';
 			return { ok: false, msg: msg };
 		}
 	}
+
 }
 
 /* ==================== UI 小工具 ==================== */
@@ -818,17 +1116,57 @@ class SyncView extends ItemView {
 		}
 	}
 
+	/** 状态卡上显示的目标标识 */
+	targetLine() {
+		const s = this.plugin.settings;
+		const t = s.provider || 'github';
+		if (t === 'jianguoyun') return s.webdavUser || '坚果云';
+		if (t === 'git') {
+			if (s.apiBase) {
+				return String(s.apiBase).replace(/^https?:\/\//, '').replace(/^www\./, '');
+			}
+			return (s.owner || '') + '/' + (s.repo || '');
+		}
+		return (s.owner || '') + '/' + (s.repo || '');
+	}
+
 	_render() {
 		const c = this.contentEl;
 		c.empty();
 		c.style.cssText = 'padding:8px;overflow-y:auto';
 		const s = this.plugin.settings;
 
-		if (!s.token) {
+		/* 目标切换 */
+		const tabs = c.createDiv();
+		tabs.style.cssText = 'display:flex;gap:5px;margin-bottom:8px';
+		const OPTS = [['github', 'GitHub'], ['git', '中国开源'], ['jianguoyun', '坚果云']];
+		for (const [v, nm] of OPTS) {
+			const b = tabs.createEl('button');
+			b.setText(nm);
+			const on = (s.provider || 'github') === v;
+			b.style.cssText =
+				'flex:1;padding:6px 2px;font-size:11px;border-radius:6px;cursor:pointer;' +
+				'border:1px solid var(--background-modifier-border);' +
+				'background:' + (on ? 'var(--interactive-accent)' : 'var(--background-primary)') + ';' +
+				'color:' + (on ? 'var(--text-on-accent)' : 'var(--text-normal)');
+			b.addEventListener('click', async () => {
+				s.provider = v;
+				await this.plugin.saveSettings();
+				this.render();
+			});
+		}
+
+		const pv = this.plugin.engine.pv();
+		if (!pv.ok()) {
 			const e = card(c);
-			e.createDiv().setText('还没连接仓库');
+			e.createDiv().setText('还没连上「' + pv.label + '」');
 			e.children[0].style.cssText = 'font-weight:600;margin-bottom:6px';
-			hint(e, '去设置里填 GitHub Token 和仓库名。需要一个有 repo 权限的 token。');
+			const TIP = {
+				github: '去设置里填 Token、用户名、仓库名。Token 需要有 repo 权限。',
+				git: '去设置里填仓库 API 地址和访问令牌。地址要填到仓库那一级。',
+				jianguoyun: '去设置里填坚果云账号和「应用密码」。应用密码不是登录密码，要在网页端单独生成。',
+			};
+			hint(e, TIP[s.provider || 'github'] || TIP.github);
 			bigBtn(e, '去设置', () => this.plugin.openSettings(), { primary: true });
 			return;
 		}
@@ -841,10 +1179,11 @@ class SyncView extends ItemView {
 		dot.setText('●');
 		dot.style.cssText = 'font-size:12px;color:var(--interactive-success)';
 		const nm = row.createDiv();
-		nm.setText(s.owner + '/' + s.repo);
+		nm.setText(this.targetLine());
 		nm.style.cssText = 'flex:1;font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis';
+		const isDav = (s.provider || 'github') === 'jianguoyun';
 		const bm = row.createDiv();
-		bm.setText(s.branch);
+		bm.setText(isDav ? 'WebDAV' : s.branch);
 		bm.style.cssText = 'font-size:10px;opacity:.5;padding:2px 6px;border-radius:8px;background:var(--background-modifier-hover)';
 
 		const info = st.createDiv();
@@ -853,7 +1192,7 @@ class SyncView extends ItemView {
 			'上次同步 ' + fmtTime(s.lastSync) +
 			(s.lastCount ? ' · 传了 ' + s.lastCount + ' 个' : ' · 无变化')
 		);
-		if (s.lastCommit) {
+		if (s.lastCommit && (s.provider || 'github') !== 'jianguoyun') {
 			const cc = st.createDiv();
 			cc.setText('commit ' + String(s.lastCommit).slice(0, 7));
 			cc.style.cssText = 'font-size:10px;opacity:.4;margin-top:2px;font-family:monospace';
@@ -921,35 +1260,118 @@ class SyncSettingTab extends PluginSettingTab {
 		c.style.cssText = 'padding:12px';
 		const s = this.plugin.settings;
 
-		/* 连接 */
-		secTitle(c, '仓库');
+		/* 目标 */
+		secTitle(c, '备份到');
 		new Setting(c)
-			.setName('GitHub Token')
-			.setDesc('需要有 repo 权限的 token。只存在本地，不会上传。')
-			.addText((t) => {
-				t.inputEl.type = 'password';
-				t.setValue(s.token).onChange(async (v) => {
-					s.token = v.trim();
+			.setName('目标')
+			.setDesc('一次同步到一个地方，随时可以改')
+			.addDropdown((d) => {
+				d.addOption('github', 'GitHub');
+				d.addOption('git', '中国开源 / 自建（自己填地址）');
+				d.addOption('jianguoyun', '坚果云（WebDAV）');
+				d.setValue(s.provider || 'github');
+				d.onChange(async (v) => {
+					s.provider = v;
 					await this.plugin.saveSettings();
+					this.plugin.refreshView();
+					this.display();
 				});
 			});
-		new Setting(c).setName('用户名').setDesc('仓库所有者')
-			.addText((t) => t.setValue(s.owner).onChange(async (v) => {
-				s.owner = v.trim(); await this.plugin.saveSettings();
-			}));
-		new Setting(c).setName('仓库名').setDesc('建议在 GitHub 上设为私有')
-			.addText((t) => t.setValue(s.repo).onChange(async (v) => {
-				s.repo = v.trim(); await this.plugin.saveSettings();
-			}));
-		new Setting(c).setName('分支').setDesc('一般填 main')
-			.addText((t) => t.setValue(s.branch).onChange(async (v) => {
-				s.branch = v.trim() || 'main'; await this.plugin.saveSettings();
-			}));
+
+		const pv = this.plugin.engine.pv();
+
+		if (s.provider === 'jianguoyun') {
+			/* 坚果云 */
+			hint(c, '坚果云要用「应用密码」，不是登录密码。到坚果云网页端：账户信息 → 安全选项 → 添加应用密码。');
+			new Setting(c).setName('服务器地址').setDesc('一般不用改，除非你用其它 WebDAV')
+				.addText((t) => t.setValue(s.webdavUrl).onChange(async (v) => {
+					s.webdavUrl = v.trim(); await this.plugin.saveSettings();
+				}));
+			new Setting(c).setName('账号').setDesc('注册邮箱')
+				.addText((t) => t.setValue(s.webdavUser).onChange(async (v) => {
+					s.webdavUser = v.trim(); await this.plugin.saveSettings();
+				}));
+			new Setting(c).setName('应用密码')
+				.addText((t) => {
+					t.inputEl.type = 'password';
+					t.setValue(s.webdavPass).onChange(async (v) => {
+						s.webdavPass = v.trim(); await this.plugin.saveSettings();
+					});
+				});
+			new Setting(c).setName('云端文件夹').setDesc('留空放根目录，填「小说备份」就存到那个文件夹里')
+				.addText((t) => t.setValue(s.remoteRoot).onChange(async (v) => {
+					s.remoteRoot = v.trim().replace(/^\/+|\/+$/g, '');
+					await this.plugin.saveSettings();
+				}));
+		} else if (s.provider === 'git') {
+			/* 通用 Git 平台 */
+			hint(c, '填仓库的 API 地址，到「仓库」那一级。\n例如 https://gitee.com/api/v5/repos/用户名/仓库名');
+			new Setting(c).setName('仓库 API 地址')
+				.addText((t) => t.setValue(s.apiBase).onChange(async (v) => {
+					s.apiBase = v.trim().replace(/\/+$/, '');
+					await this.plugin.saveSettings();
+					this.plugin.refreshView();
+				}));
+			new Setting(c).setName('用户名').setDesc('选填，只用来显示').addText((t) =>
+				t.setValue(s.owner).onChange(async (v) => {
+					s.owner = v.trim(); await this.plugin.saveSettings();
+				}));
+			new Setting(c).setName('仓库名').setDesc('选填，只用来显示').addText((t) =>
+				t.setValue(s.repo).onChange(async (v) => {
+					s.repo = v.trim(); await this.plugin.saveSettings();
+				}));
+			new Setting(c).setName('访问令牌').setDesc('各平台叫法不同：私人令牌 / Access Token')
+				.addText((t) => {
+					t.inputEl.type = 'password';
+					t.setValue(s.token).onChange(async (v) => {
+						s.token = v.trim(); await this.plugin.saveSettings();
+					});
+				});
+			new Setting(c).setName('分支').setDesc('Gitee 一般是 master')
+				.addText((t) => t.setValue(s.branch).onChange(async (v) => {
+					s.branch = v.trim() || 'master'; await this.plugin.saveSettings();
+				}));
+			new Setting(c).setName('远端目录前缀').setDesc('留空 = 放仓库根目录')
+				.addText((t) => t.setValue(s.remoteRoot).onChange(async (v) => {
+					s.remoteRoot = v.trim().replace(/^\/+|\/+$/g, '');
+					await this.plugin.saveSettings();
+				}));
+		} else {
+			/* GitHub */
+			new Setting(c)
+				.setName('GitHub Token')
+				.setDesc('需要有 repo 权限的 token。只存在本地，不会上传。')
+				.addText((t) => {
+					t.inputEl.type = 'password';
+					t.setValue(s.token).onChange(async (v) => {
+						s.token = v.trim();
+						await this.plugin.saveSettings();
+					});
+				});
+			new Setting(c).setName('用户名').setDesc('仓库所有者')
+				.addText((t) => t.setValue(s.owner).onChange(async (v) => {
+					s.owner = v.trim(); await this.plugin.saveSettings();
+				}));
+			new Setting(c).setName('仓库名').setDesc('建议在 GitHub 上设为私有')
+				.addText((t) => t.setValue(s.repo).onChange(async (v) => {
+					s.repo = v.trim(); await this.plugin.saveSettings();
+				}));
+			new Setting(c).setName('分支').setDesc('一般填 main')
+				.addText((t) => t.setValue(s.branch).onChange(async (v) => {
+					s.branch = v.trim() || 'main'; await this.plugin.saveSettings();
+				}));
+			new Setting(c).setName('远端目录前缀').setDesc('留空 = 放仓库根目录')
+				.addText((t) => t.setValue(s.remoteRoot).onChange(async (v) => {
+					s.remoteRoot = v.trim().replace(/^\/+|\/+$/g, '');
+					await this.plugin.saveSettings();
+				}));
+		}
 
 		bigBtn(c, '测试连接', async () => {
 			const r = await this.plugin.engine.test();
 			new Notice((r.ok ? '✅ ' : '❌ ') + r.msg, 6000);
 		}, { slim: true });
+		if (pv && pv.label) hint(c, '当前目标：' + pv.label);
 
 		/* 范围 */
 		secTitle(c, '同步范围');

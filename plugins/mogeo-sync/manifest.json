@@ -1,9 +1,9 @@
 {
   "id": "mogeo-sync",
   "name": "小说同步",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "minAppVersion": "1.4.0",
-  "description": "把笔记备份到 GitHub 私有仓库。左侧栏面板一键同步，长按文件夹单独同步，只上传变化的文件，一次提交。",
+  "description": "备份笔记到 GitHub / 国内 Git 平台 / 坚果云。面板一键切换目标，只上传不下载，增量同步。",
   "author": "Mogeo",
   "isDesktopOnly": false
 }
