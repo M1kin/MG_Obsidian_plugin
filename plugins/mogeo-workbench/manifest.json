@@ -1,0 +1,9 @@
+{
+  "id": "mogeo-workbench",
+  "name": "创作工作台",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "插件功能聚合：自动扫描全部插件及其命令，收藏常用的、自定义别名图标、按自己的分组摆放，一个面板点完所有操作。",
+  "author": "Mogeo",
+  "isDesktopOnly": false
+}

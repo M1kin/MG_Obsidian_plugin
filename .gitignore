@@ -1,0 +1,16 @@
+# Obsidian 运行时数据（含 API Key，绝不上传）
+data.json
+*.zip
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+package-lock.json
+
+# 日志
+*.log

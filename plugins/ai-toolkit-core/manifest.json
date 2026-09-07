@@ -1,0 +1,9 @@
+{
+  "id": "ai-toolkit-core",
+  "name": "Mogeo Core",
+  "version": "2.0.2",
+  "minAppVersion": "1.4.0",
+  "description": "前置依赖插件 + 插件状态中心。安装并启用后，Folder to TXT、MultiTTS Reader、文件夹查找替换、AI 写作助手、AI 回复朗读、TTS 诊断医生、Book Smith 才能正常使用；同时提供插件总览、冲突检查与打赏接入。",
+  "author": "Mogeo",
+  "isDesktopOnly": false
+}

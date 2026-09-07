@@ -1,0 +1,9 @@
+{
+  "id": "ai-writer",
+  "name": "AI 写作助手",
+  "version": "2.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "接入 OpenAI 兼容接口：选中文字交给 AI 改写续写、一键续写当前笔记、侧边栏对话聊天。支持 DeepSeek、Kimi、硅基流动、通义、智谱等国内服务与自定义中转站，安卓可用。",
+  "author": "Mogeo",
+  "isDesktopOnly": false
+}

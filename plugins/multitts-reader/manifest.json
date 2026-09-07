@@ -1,0 +1,9 @@
+{
+  "id": "multitts-reader",
+  "name": "MultiTTS Reader 朗读",
+  "version": "2.5.0",
+  "minAppVersion": "1.4.0",
+  "description": "右下角三按钮悬浮条（播放/暂停/停止）朗读笔记，从光标处开始，安卓可用。",
+  "author": "Mogeo",
+  "isDesktopOnly": false
+}

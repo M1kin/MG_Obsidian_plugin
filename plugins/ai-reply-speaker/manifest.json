@@ -1,0 +1,9 @@
+{
+  "id": "ai-reply-speaker",
+  "name": "AI 回复朗读",
+  "version": "1.2.0",
+  "minAppVersion": "1.0.0",
+  "description": "把 AI 写作助手的回复念出来。需要 Core + AI 写作助手 + MultiTTS Reader 都在",
+  "author": "Mogeo",
+  "isDesktopOnly": false
+}

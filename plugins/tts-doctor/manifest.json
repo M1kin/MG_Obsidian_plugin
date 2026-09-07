@@ -1,0 +1,9 @@
+{
+  "id": "tts-doctor",
+  "name": "TTS 诊断医生",
+  "version": "1.2.0",
+  "minAppVersion": "1.0.0",
+  "description": "排查 MultiTTS 合成失败：测不同长度、不同内容的文本，看服务端到底回了什么",
+  "author": "Mogeo",
+  "isDesktopOnly": false
+}

@@ -1,0 +1,9 @@
+{
+  "id": "folder-to-txt",
+  "name": "Folder to TXT 合并导出",
+  "version": "1.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "把一个文件夹里的 Markdown 合并成一个 TXT 文件，自动补上章节标题，支持手机端。",
+  "author": "Mogeo",
+  "isDesktopOnly": false
+}

@@ -1,0 +1,9 @@
+{
+  "id": "find-replace",
+  "name": "文件夹查找替换",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "在当前笔记或整个文件夹的笔记里批量查找替换文字，带命中预览和自动备份，支持手机端。",
+  "author": "Mogeo",
+  "isDesktopOnly": false
+}

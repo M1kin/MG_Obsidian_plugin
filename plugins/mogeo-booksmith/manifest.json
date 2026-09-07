@@ -1,0 +1,9 @@
+{
+  "id": "mogeo-booksmith",
+  "name": "书籍写作",
+  "version": "1.4.0",
+  "minAppVersion": "1.4.0",
+  "description": "小说工作台：一本书就是一个文件夹。侧边栏管理书籍、章节拖拽排序、封面设置、字数进度，导出整本书复用 Folder to TXT。",
+  "author": "Mogeo",
+  "isDesktopOnly": false
+}
