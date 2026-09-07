@@ -10,6 +10,8 @@
  *
  * Core 在 → 返回完整 API；Core 不在 → 提示并跳设置页，返回 null。
  *
+ * meta 里带 sponsor 就自动登记打赏，见文件末尾「打赏接入」。
+ *
  * 设计上故意做成"薄壳"：真正的实现在 Core 里。
  * 这样以后 Core 升级能力，所有插件自动受益，SDK 文件不用动。
  */
@@ -107,16 +109,22 @@ const Mogeo = {
 	boot: function (plugin, meta) {
 		const I = impl(plugin);
 		if (I) {
+			let api = null;
 			try {
-				return I.boot(plugin, meta);
+				api = I.boot(plugin, meta);
 			} catch (e) {
 				/* Core 出错也不能拖垮本插件 */
 			}
-			try {
-				return I;
-			} catch (e) {
-				return null;
+			if (!api) {
+				try {
+					api = I;
+				} catch (e) {
+					return null;
+				}
 			}
+			// meta 里带了 sponsor 就顺手登记，插件连 registerDeveloper 都不用写
+			Mogeo._registerSponsor(plugin, api, meta);
+			return api;
 		}
 		// Core 不在或没启用 → 静默返回 null。
 		//
@@ -174,6 +182,85 @@ const Mogeo = {
 	/** Core 活着吗（不弹提示） */
 	alive: function (plugin) {
 		return coreLive(plugin && plugin.app);
+	},
+
+	/* ---- 打赏接入 ---- */
+
+	/**
+	 * boot 时自动调用。meta.sponsor 有值就登记，没值什么都不做
+	 * （避免挂个空弹窗上去）。
+	 *
+	 * 三种写法：
+	 *   { images: { 微信: 'data:image/png;base64,...' } }   // base64，推荐
+	 *   { image:  'https://...' }                          // 网络图，必须 https
+	 *   { link:   'https://afdian.net/a/xxx' }             // 网页链接
+	 *
+	 * 还可以加 linkName 自定义第三个标签的名字（默认「网页」）。
+	 */
+	_registerSponsor: function (plugin, api, meta) {
+		try {
+			const sp = meta && meta.sponsor;
+			if (!sp) return false;
+			const has =
+				(sp.images && Object.keys(sp.images).length) || sp.image || sp.link;
+			if (!has) return false;
+			const id =
+				(meta && meta.id) ||
+				(plugin && plugin.manifest && plugin.manifest.id) ||
+				'';
+			const info = {
+				name: (meta && meta.author) || (meta && meta.name) || id,
+				pluginId: id,
+				sponsor: sp,
+			};
+			if (api && typeof api.registerDeveloper === 'function') {
+				return api.registerDeveloper(info);
+			}
+			return false;
+		} catch (e) {
+			return false;
+		}
+	},
+
+	/** 弹自己的打赏窗（name 省略就是第一张） */
+	sponsor: function (plugin, name) {
+		const I = impl(plugin);
+		if (!I) return false;
+		try {
+			const id =
+				(plugin && plugin.manifest && plugin.manifest.id) || '';
+			if (typeof I.openSponsorFor === 'function' && id) {
+				return I.openSponsorFor(id, name);
+			}
+			if (typeof I.showSponsor === 'function') return I.showSponsor(name);
+			return false;
+		} catch (e) {
+			return false;
+		}
+	},
+
+	/** 查自己登记成功没 */
+	sponsorInfo: function (plugin) {
+		const I = impl(plugin);
+		if (!I) return null;
+		try {
+			const id = (plugin && plugin.manifest && plugin.manifest.id) || '';
+			if (typeof I.sponsorFor === 'function' && id) return I.sponsorFor(id);
+			return null;
+		} catch (e) {
+			return null;
+		}
+	},
+
+	/** 作者自己的打赏图（微信/支付宝...） */
+	sponsorImages: function (plugin) {
+		const I = impl(plugin);
+		if (!I || typeof I.sponsorImages !== 'function') return null;
+		try {
+			return I.sponsorImages();
+		} catch (e) {
+			return null;
+		}
 	},
 };
 
