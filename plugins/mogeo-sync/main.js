@@ -861,6 +861,9 @@ class SyncEngine {
 	 */
 	async sync(opt) {
 		opt = opt || {};
+		const tick = (ev) => {
+			try { if (typeof opt.onProgress === 'function') opt.onProgress(ev); } catch (e) { /* 忽略 */ }
+		};
 		if (this.running) return { ok: false, msg: '正在同步中' };
 		const g = this.pv();
 		if (!g.ok()) {
@@ -872,6 +875,13 @@ class SyncEngine {
 			if (!files.length) {
 				return { ok: false, msg: '没有要同步的文件（检查同步文件夹设置）' };
 			}
+			// 先把全部列成"等待"，面板能立刻看到条目
+			tick({
+				phase: 'list',
+				total: files.length,
+				done: 0,
+				items: files.map((f) => ({ path: f.path, state: 'wait' })),
+			});
 
 			// 1) 远端指纹。WebDAV 返回 null（列目录太贵），纯靠本地记录判断
 			let remote = null;
@@ -895,10 +905,14 @@ class SyncEngine {
 				const rp = g.remotePath(f.path);
 				const localSha = blobSha(u8);
 				// 本地记录就是这个 → 没改过，跳过（不用问远端，快）
-				if (shas[f.path] === localSha) continue;
+				if (shas[f.path] === localSha) {
+					tick({ phase: 'item', path: f.path, state: 'skip' });
+					continue;
+				}
 				// 本地记录不一样，但远端已经有同样内容（换设备/清过记录）
 				if (remote && remote[rp] === localSha) {
 					shas[f.path] = localSha;
+					tick({ phase: 'item', path: f.path, state: 'skip' });
 					continue;
 				}
 				changed.push({ file: f, rp: rp, u8: u8, sha: localSha });
@@ -924,11 +938,21 @@ class SyncEngine {
 			if (opt.reason === 'menu') msg += '（长按文件夹同步）';
 
 			let commit = '';
+			let n = 0;
 			if (g.atomic) {
+				// GitHub 是先建 blob 再一次提交，条目逐个标"上传中"
+				for (const c of changed) {
+					tick({ phase: 'item', path: c.file.path, state: 'up', at: ++n, of: changed.length });
+				}
 				commit = await g.commitAll(changed, msg);
+				for (const c of changed) {
+					tick({ phase: 'item', path: c.file.path, state: 'ok' });
+				}
 			} else {
 				for (const c of changed) {
+					tick({ phase: 'item', path: c.file.path, state: 'up', at: ++n, of: changed.length });
 					await g.put(c.rp, c.u8, c.sha, msg);
+					tick({ phase: 'item', path: c.file.path, state: 'ok' });
 				}
 			}
 
@@ -941,6 +965,7 @@ class SyncEngine {
 			await this.plugin.saveSettings();
 			this.plugin.refreshView();
 
+			tick({ phase: 'done', changed: changed.length, total: files.length, commit: commit });
 			return {
 				ok: true,
 				changed: changed.length,
@@ -954,6 +979,7 @@ class SyncEngine {
 			if (st === 401) msg = g.label + '：账号或令牌不对';
 			else if (st === 404) msg = g.label + '：仓库不存在，或令牌没权限';
 			else if (st === 403) msg = g.label + '：被限流了，等一会再试';
+			tick({ phase: 'fail', msg: msg });
 			return { ok: false, msg: msg };
 		} finally {
 			this.running = false;
@@ -1116,6 +1142,87 @@ class SyncView extends ItemView {
 		}
 	}
 
+	/** 同步进度 + 文件条目 */
+	_renderProgress(c) {
+		const p = this.plugin.prog;
+		if (!p || (!p.on && !p.items.length)) return;
+
+		const box = card(c);
+		const head = box.createDiv();
+		head.style.cssText = 'display:flex;align-items:center;gap:6px;margin-bottom:6px';
+
+		const ttl = head.createDiv();
+		const running = !!p.on;
+		ttl.setText(running ? '正在备份…' : p.fail ? '备份失败' : '备份完成');
+		ttl.style.cssText = 'flex:1;font-size:12px;font-weight:600';
+
+		const cnt = head.createDiv();
+		cnt.setText(p.done + '/' + p.total);
+		cnt.style.cssText = 'font-size:11px;opacity:.6';
+
+		if (!running && !p.fail) {
+			const clr = head.createEl('button');
+			clr.setText('清空');
+			clr.style.cssText =
+				'padding:2px 8px;font-size:11px;border-radius:5px;cursor:pointer;' +
+				'border:1px solid var(--background-modifier-border);' +
+				'background:var(--background-primary);color:var(--text-normal)';
+			clr.addEventListener('click', () => {
+				this.plugin.prog = null;
+				this.render();
+			});
+		}
+
+		/* 进度条 */
+		const bar = box.createDiv();
+		bar.style.cssText =
+			'height:3px;border-radius:2px;background:var(--background-modifier-hover);' +
+			'overflow:hidden;margin-bottom:6px';
+		const fill = bar.createDiv();
+		const pct = p.total ? Math.round((p.done / p.total) * 100) : 0;
+		fill.style.cssText =
+			'height:100%;width:' + pct + '%;background:' +
+			(p.fail ? 'var(--text-error)' : 'var(--interactive-accent)') + ';transition:width .2s';
+
+		if (p.fail) {
+			const e = box.createDiv();
+			e.setText(p.fail);
+			e.style.cssText = 'font-size:11px;color:var(--text-error);margin-bottom:6px';
+		}
+
+		/* 条目：只显示有状态的，最多 8 条，剩下的折叠成一行 */
+		const MARK = { wait: '·', up: '↑', ok: '✓', skip: '–' };
+		const COLOR = {
+			wait: 'opacity:.35',
+			up: 'color:var(--interactive-accent)',
+			ok: 'color:var(--interactive-success)',
+			skip: 'opacity:.3',
+		};
+		const shown = p.items.slice(0, 8);
+		for (const it of shown) {
+			const r = box.createDiv();
+			r.style.cssText =
+				'display:flex;align-items:center;gap:6px;padding:3px 0;font-size:11px;' +
+				(COLOR[it.state] || '');
+			const mk = r.createDiv();
+			mk.setText(MARK[it.state] || '·');
+			mk.style.cssText = 'width:10px;flex:0 0 10px;text-align:center';
+			const nm = r.createDiv();
+			nm.setText(it.path);
+			nm.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+		}
+		if (p.items.length > 8) {
+			const more = box.createDiv();
+			more.setText('…还有 ' + (p.items.length - 8) + ' 个');
+			more.style.cssText = 'font-size:10px;opacity:.4;padding-top:2px';
+		}
+		if (!p.items.length && running) {
+			const w = box.createDiv();
+			w.setText('准备中…');
+			w.style.cssText = 'font-size:11px;opacity:.5';
+		}
+	}
+
 	/** 状态卡上显示的目标标识 */
 	targetLine() {
 		const s = this.plugin.settings;
@@ -1200,6 +1307,9 @@ class SyncView extends ItemView {
 
 		/* 主按钮 */
 		bigBtn(c, '立即备份', async () => await this.plugin.doSync({}), { primary: true });
+
+		/* 进度 */
+		this._renderProgress(c);
 
 		/* 文件夹列表 */
 		const folders = s.folders || [];
@@ -1457,7 +1567,7 @@ module.exports = class SyncPlugin extends Plugin {
 
 		this.addCommand({
 			id: 'sync',
-			name: '立即备份到 GitHub',
+			name: '立即备份',
 			callback: () => this.doSync({}),
 		});
 		this.addCommand({
@@ -1479,7 +1589,7 @@ module.exports = class SyncPlugin extends Plugin {
 			this.app.workspace.on('file-menu', (menu, file) => {
 				if (!file || !(file instanceof TFolder)) return;
 				menu.addItem((item) => {
-					item.setTitle('📤 同步此文件夹到 GitHub')
+					item.setTitle('📤 同步此文件夹到' + this.targetName())
 						.setIcon('cloud-upload')
 						.onClick(() => this.doSync({ folder: file.path, reason: 'menu' }));
 				});
@@ -1515,11 +1625,17 @@ module.exports = class SyncPlugin extends Plugin {
 			new Notice('需要启用「' + CORE_NAME + '」\n设置 → 第三方插件', 8000);
 			return;
 		}
+		// 面板进度：先清成"准备中"，引擎会逐个 tick 更新
+		this.prog = { on: true, items: [], done: 0, total: 0, fail: '', at: Date.now() };
+		this.refreshView();
 		const n = new Notice('正在备份…', 0);
-		const r = await this.engine.sync(opt);
+		const r = await this.engine.sync(
+			Object.assign({}, opt, { onProgress: (ev) => this.onProg(ev) })
+		);
 		n.hide();
+		this.prog.on = false;
 		if (r.needSetup) {
-			new Notice('先去设置里填 Token 和仓库名', 6000);
+			new Notice('先去设置里填' + this.targetName() + '的账号信息', 6000);
 			this.openSettings();
 			return;
 		}
@@ -1529,6 +1645,40 @@ module.exports = class SyncPlugin extends Plugin {
 			new Notice('❌ ' + r.msg, 8000);
 		}
 		this.refreshView();
+	}
+
+	/** 当前目标的短名，菜单/提示里用 */
+	targetName() {
+		const t = (this.settings && this.settings.provider) || 'github';
+		return t === 'jianguoyun' ? '坚果云' : t === 'git' ? 'Git 仓库' : 'GitHub';
+	}
+
+	/** 引擎进度回调 → 存进 this.prog，面板读它渲染 */
+	onProg(ev) {
+		try {
+			const p = this.prog;
+			if (!p) return;
+			if (ev.phase === 'list') {
+				p.items = (ev.items || []).map((x) => ({ path: x.path, state: 'wait' }));
+				p.total = ev.total || p.items.length;
+				p.done = 0;
+			} else if (ev.phase === 'item') {
+				const it = p.items.filter((x) => x.path === ev.path)[0];
+				if (it) {
+					it.state = ev.state;
+					if (ev.state !== 'up') p.done = Math.min(p.total, p.done + 1);
+				} else {
+					p.items.push({ path: ev.path, state: ev.state });
+					if (ev.state !== 'up') p.done = Math.min(p.total, p.done + 1);
+				}
+				if (ev.of) p.total = Math.max(p.total, ev.of);
+			} else if (ev.phase === 'done' || ev.phase === 'fail') {
+				p.fail = ev.phase === 'fail' ? ev.msg || '出错了' : '';
+			}
+			this.refreshView();
+		} catch (e) {
+			/* 进度出问题也不能影响同步本身 */
+		}
 	}
 
 	openSettings() {
