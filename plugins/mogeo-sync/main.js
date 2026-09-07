@@ -792,6 +792,22 @@ class SyncEngine {
 		this.plugin = plugin;
 		this.app = plugin.app;
 		this.running = false;
+		/** 用户点了停止 */
+		this._abort = false;
+	}
+
+	/** 请求停止。已在飞的那个请求停不掉，只在文件之间生效 */
+	abort() {
+		this._abort = true;
+	}
+
+	/** 该停了吗（是就抛一个带标记的错误，让外层走同一套收尾） */
+	_checkAbort() {
+		if (this._abort) {
+			const e = new Error('已停止');
+			e.aborted = true;
+			throw e;
+		}
 	}
 
 	cfg() {
@@ -869,12 +885,15 @@ class SyncEngine {
 		if (!g.ok()) {
 			return { ok: false, msg: '还没填仓库信息', needSetup: true };
 		}
+		this._abort = false;
+		this._sent = [];
 		this.running = true;
 		try {
 			const files = this.collect(opt.folder);
 			if (!files.length) {
 				return { ok: false, msg: '没有要同步的文件（检查同步文件夹设置）' };
 			}
+			this._checkAbort();
 			// 先把全部列成"等待"，面板能立刻看到条目
 			tick({
 				phase: 'list',
@@ -939,7 +958,11 @@ class SyncEngine {
 
 			let commit = '';
 			let n = 0;
+			const sent = this._sent;
 			if (g.atomic) {
+				// GitHub 是一次性 build tree + commit，中间没法停。
+				// 所以只在开始之前检查一次。
+				this._checkAbort();
 				// GitHub 是先建 blob 再一次提交，条目逐个标"上传中"
 				for (const c of changed) {
 					tick({ phase: 'item', path: c.file.path, state: 'up', at: ++n, of: changed.length });
@@ -947,17 +970,21 @@ class SyncEngine {
 				commit = await g.commitAll(changed, msg);
 				for (const c of changed) {
 					tick({ phase: 'item', path: c.file.path, state: 'ok' });
+					sent.push(c);
 				}
 			} else {
 				for (const c of changed) {
+					// 停在每个文件之前：已经在传的那个停不掉，但不会再发下一个
+					this._checkAbort();
 					tick({ phase: 'item', path: c.file.path, state: 'up', at: ++n, of: changed.length });
 					await g.put(c.rp, c.u8, c.sha, msg);
 					tick({ phase: 'item', path: c.file.path, state: 'ok' });
+					sent.push(c);
 				}
 			}
 
-			// 4) 记住指纹
-			for (const c of changed) shas[c.file.path] = c.sha;
+			// 4) 记住指纹（只记真正传完的，中断的没传就不记，下次会重传）
+			for (const c of sent) shas[c.file.path] = c.sha;
 			this.cfg().shas = shas;
 			this.cfg().lastSync = Date.now();
 			this.cfg().lastCommit = commit || this.cfg().lastCommit || '';
@@ -965,15 +992,33 @@ class SyncEngine {
 			await this.plugin.saveSettings();
 			this.plugin.refreshView();
 
-			tick({ phase: 'done', changed: changed.length, total: files.length, commit: commit });
+			tick({ phase: 'done', changed: sent.length, total: files.length, commit: commit });
 			return {
 				ok: true,
-				changed: changed.length,
+				changed: sent.length,
 				total: files.length,
 				commit: commit,
-				msg: '已备份 ' + changed.length + ' 个文件',
+				msg: '已备份 ' + sent.length + ' 个文件',
 			};
 		} catch (e) {
+			// 中止：已传完的算数，剩下的下次再来
+			if (e && e.aborted) {
+				const n2 = this._sent.length;
+				// 关键：把中断前已传完的记进指纹，下次不用重传
+				const sh2 = this.cfg().shas || {};
+				for (const c of this._sent) sh2[c.file.path] = c.sha;
+				this.cfg().shas = sh2;
+				this.cfg().lastSync = Date.now();
+				this.cfg().lastCount = n2;
+				await this.plugin.saveSettings();
+				tick({ phase: 'stop', changed: n2 });
+				return {
+					ok: true,
+					aborted: true,
+					changed: n2,
+					msg: '已停止（' + n2 + ' 个已传完，剩下的下次再传）',
+				};
+			}
 			const st = e && e.status;
 			let msg = (e && e.message) || String(e);
 			if (st === 401) msg = g.label + '：账号或令牌不对';
@@ -983,6 +1028,7 @@ class SyncEngine {
 			return { ok: false, msg: msg };
 		} finally {
 			this.running = false;
+			this._abort = false;
 		}
 	}
 
@@ -1004,6 +1050,17 @@ class SyncEngine {
 		}
 	}
 
+}
+
+/** 中断时已传完几个：看面板进度里标 ok 的 */
+function sentLen(engine) {
+	try {
+		const p = engine.plugin.prog;
+		if (!p || !p.items) return 0;
+		return p.items.filter((x) => x.state === 'ok').length;
+	} catch (e) {
+		return 0;
+	}
 }
 
 /* ==================== UI 小工具 ==================== */
@@ -1153,14 +1210,32 @@ class SyncView extends ItemView {
 
 		const ttl = head.createDiv();
 		const running = !!p.on;
-		ttl.setText(running ? '正在备份…' : p.fail ? '备份失败' : '备份完成');
+		ttl.setText(
+			running ? '正在备份…'
+				: p.fail ? '备份失败'
+				: p.stopped ? '已停止'
+				: '备份完成'
+		);
 		ttl.style.cssText = 'flex:1;font-size:12px;font-weight:600';
 
 		const cnt = head.createDiv();
 		cnt.setText(p.done + '/' + p.total);
 		cnt.style.cssText = 'font-size:11px;opacity:.6';
 
-		if (!running && !p.fail) {
+		if (running) {
+			// 进行中：给停止，不给清空
+			const stp = head.createEl('button');
+			stp.setText('停止');
+			stp.style.cssText =
+				'padding:2px 8px;font-size:11px;border-radius:5px;cursor:pointer;' +
+				'border:1px solid var(--text-error);' +
+				'background:var(--background-primary);color:var(--text-error)';
+			stp.addEventListener('click', () => {
+				stp.setText('停止中');
+				stp.disabled = true;
+				this.plugin.stopSync();
+			});
+		} else if (!p.fail) {
 			const clr = head.createEl('button');
 			clr.setText('清空');
 			clr.style.cssText =
@@ -1182,12 +1257,19 @@ class SyncView extends ItemView {
 		const pct = p.total ? Math.round((p.done / p.total) * 100) : 0;
 		fill.style.cssText =
 			'height:100%;width:' + pct + '%;background:' +
-			(p.fail ? 'var(--text-error)' : 'var(--interactive-accent)') + ';transition:width .2s';
+			(p.fail ? 'var(--text-error)'
+				: p.stopped ? 'var(--text-warning)'
+				: 'var(--interactive-accent)') + ';transition:width .2s';
 
 		if (p.fail) {
 			const e = box.createDiv();
 			e.setText(p.fail);
 			e.style.cssText = 'font-size:11px;color:var(--text-error);margin-bottom:6px';
+		}
+		if (p.stopped) {
+			const e = box.createDiv();
+			e.setText('已传完的会记住，剩下的下次接着传');
+			e.style.cssText = 'font-size:11px;opacity:.6;margin-bottom:6px';
 		}
 
 		/* 条目：只显示有状态的，最多 8 条，剩下的折叠成一行 */
@@ -1571,6 +1653,11 @@ module.exports = class SyncPlugin extends Plugin {
 			callback: () => this.doSync({}),
 		});
 		this.addCommand({
+			id: 'stop',
+			name: '停止备份',
+			callback: () => this.stopSync(),
+		});
+		this.addCommand({
 			id: 'open',
 			name: '打开同步面板',
 			callback: () => this.activateView(),
@@ -1626,7 +1713,7 @@ module.exports = class SyncPlugin extends Plugin {
 			return;
 		}
 		// 面板进度：先清成"准备中"，引擎会逐个 tick 更新
-		this.prog = { on: true, items: [], done: 0, total: 0, fail: '', at: Date.now() };
+		this.prog = { on: true, items: [], done: 0, total: 0, fail: '', stopped: false, at: Date.now() };
 		this.refreshView();
 		const n = new Notice('正在备份…', 0);
 		const r = await this.engine.sync(
@@ -1639,12 +1726,20 @@ module.exports = class SyncPlugin extends Plugin {
 			this.openSettings();
 			return;
 		}
-		if (r.ok) {
+		if (r.aborted) {
+			new Notice('⏹ ' + r.msg, 5000);
+		} else if (r.ok) {
 			new Notice('✅ ' + r.msg + (r.changed ? '（共 ' + r.total + ' 个文件）' : ''), 4000);
 		} else {
 			new Notice('❌ ' + r.msg, 8000);
 		}
 		this.refreshView();
+	}
+
+	/** 用户点停止：只是让引擎不再发下一个请求 */
+	stopSync() {
+		try { this.engine.abort(); } catch (e) { /* 忽略 */ }
+		new Notice('正在停止…', 2500);
 	}
 
 	/** 当前目标的短名，菜单/提示里用 */
@@ -1672,8 +1767,9 @@ module.exports = class SyncPlugin extends Plugin {
 					if (ev.state !== 'up') p.done = Math.min(p.total, p.done + 1);
 				}
 				if (ev.of) p.total = Math.max(p.total, ev.of);
-			} else if (ev.phase === 'done' || ev.phase === 'fail') {
-				p.fail = ev.phase === 'fail' ? ev.msg || '出错了' : '';
+			} else if (ev.phase === 'done' || ev.phase === 'fail' || ev.phase === 'stop') {
+				if (ev.phase === 'fail') p.fail = ev.msg || '出错了';
+				if (ev.phase === 'stop') p.stopped = true;
 			}
 			this.refreshView();
 		} catch (e) {
